@@ -1,0 +1,174 @@
+# =============================================================================
+# GBMVax — central configuration
+# =============================================================================
+# Every hyperparameter, threshold, and file path lives here. No magic numbers
+# inside modules. To run a different experiment, copy this file and pass it
+# via --config; do not edit module code.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Data paths. Resolved relative to project root unless absolute.
+# ---------------------------------------------------------------------------
+paths:
+  # Project root — overridden by environment variable GBMVAX_ROOT if set.
+  root: "~/GBMVax"
+
+  iedb:
+    mhc_ligand: "data/iedb/mhc_ligand_full.csv"
+    tcell: "data/iedb/tcell_full_v3"
+  hla:
+    sequences: "data/hla/hla_prot.fasta"
+  proteome:
+    human: "data/proteome/human_proteome.fasta"
+  tcga:
+    gbm_2013: "data/tcga/gbm_2013/data_mutations.txt"        # PRIMARY training cohort, 577 patients
+    gbm_2008: "data/tcga/gbm_2008/data_mutations.txt"        # 91 patients
+    cptac_2021: "data/tcga/cptac_2021/data_mutations.txt"    # 99 patients
+    columbia_2019: "data/tcga/columbia_2019/data_mutations.txt"  # 42 patients, held-out validation
+  validation:
+    keskin_2019: "data/validation/keskin_2019"
+    hilf_2019: "data/validation/hilf_2019"
+  netmhcpan: "netMHCpan-4.2c/netMHCpan"   # Baseline tool — Darwin arm64 binary
+
+  # Outputs
+  checkpoints: "checkpoints"
+  results: "results"
+  logs: "logs"
+
+# ---------------------------------------------------------------------------
+# Peptide generation — sliding-window mutant peptides from missense calls.
+# ---------------------------------------------------------------------------
+# Class I HLA molecules present peptides of length 8–11. 9-mers are by far
+# the most common in MHC-I crystal structures (B and F pockets fix the
+# peptide ends at ~9 residues), but 8/10/11-mers do bind, so we generate
+# all four lengths and let the model decide. We do NOT include 12+ because
+# those are class II and require an entirely different binding model.
+peptide:
+  lengths: [8, 9, 10, 11]
+  flank_length: 11           # Residues on each side of the mutation for context (used for processing prediction)
+  amino_acids: "ACDEFGHIKLMNPQRSTVWY"   # Canonical 20; everything else (X, U, *) is filtered
+
+# ---------------------------------------------------------------------------
+# HLA binding model — multi-task transformer.
+# ---------------------------------------------------------------------------
+# Two heads:
+#   (1) Binding affinity   — regression on log-transformed IC50 (nM)
+#   (2) Presentation       — binary classification on eluted-ligand data
+# Multi-task because binding ≠ presentation. A peptide can bind tightly in
+# vitro yet never make it to the cell surface (failure at proteasome, TAP,
+# or HLA loading). Eluted-ligand mass spec measurements capture the joint
+# event of "actually presented." Training both heads on shared layers
+# regularizes the model and exploits the larger affinity dataset to help
+# the smaller presentation dataset.
+hla_model:
+  embed_dim: 128
+  num_heads: 8
+  num_layers: 4
+  dropout: 0.1
+  ff_hidden: 512                          # Feed-forward width inside transformer blocks
+  max_peptide_len: 11
+  hla_pseudosequence_length: 34           # NetMHCpan convention — 34 polymorphic residues within 8 Å of peptide
+  vocab: "ACDEFGHIKLMNPQRSTVWY-"          # 20 amino acids + padding token
+
+  # Output heads
+  binding_loss_weight: 1.0
+  presentation_loss_weight: 1.0           # Tune up if presentation set is small relative to affinity set
+
+  # Thresholds (nM IC50)
+  strong_binder_threshold: 50.0
+  weak_binder_threshold: 500.0
+
+  # Training
+  batch_size: 256
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+  num_epochs: 50
+  early_stopping_patience: 5
+  gradient_clip: 1.0
+  warmup_steps: 1000
+
+# ---------------------------------------------------------------------------
+# Antigen processing — NetChop + TAP score + learned GBM re-ranker.
+# ---------------------------------------------------------------------------
+# A peptide must (1) be cleaved out of the parent protein by the
+# proteasome, (2) be transported into the ER by TAP, and (3) survive ERAP1
+# N-terminal trimming. Skipping any of these means the peptide never
+# reaches HLA. NetChop predicts (1); a simple TAP-affinity table approximates
+# (2). The learned re-ranker is trained on the immunopeptidomics eluted-ligand
+# set, where every observed peptide passed all three steps.
+processing:
+  netchop_threshold: 0.5              # Proteasomal cleavage probability at C-terminus
+  tap_affinity_weight: 0.3            # Weight of TAP score in combined processing score
+  reranker_hidden_dim: 64
+
+# ---------------------------------------------------------------------------
+# Cross-reactivity filter — autoimmunity safety check.
+# ---------------------------------------------------------------------------
+# A neoantigen vaccine should NOT activate T cells that also recognize
+# self-peptides — that is the molecular definition of autoimmunity. We
+# scan every candidate peptide against the human proteome and reject any
+# peptide whose nearest self-match exceeds the similarity threshold.
+# Similarity is computed via BLOSUM62-scored alignment normalized to
+# [0, 1]. Anchor residues (P2 and P-omega) are weighted higher because
+# they dominate TCR contacts.
+cross_reactivity:
+  similarity_threshold: 0.8            # Reject if nearest self-match scaled BLOSUM62 ≥ 0.8
+  blosum_matrix: "BLOSUM62"
+  anchor_weight: 1.5                   # Multiplier on P2 / P-omega positions
+  use_kmer_prefilter: true             # Skip exhaustive scan if no shared 5-mer exists
+  kmer_prefilter_k: 5
+
+# ---------------------------------------------------------------------------
+# Clonal weighting — favor truncal mutations.
+# ---------------------------------------------------------------------------
+# A vaccine targeting a subclonal mutation only kills the subclone; the
+# truncal clone escapes and the tumor recurs. We weight peptides by
+# Variant Allele Frequency (VAF). For v1, this is the raw VAF from the
+# MAF; for v2, this hook calls PyClone-VI to estimate Cancer Cell Fraction
+# (CCF), which corrects VAF for tumor purity and local copy number.
+clonal:
+  min_vaf: 0.05                         # Below this, treat as sequencing noise
+  clonal_vaf_threshold: 0.3             # Above this, consider the mutation truly clonal
+  vaf_column_candidates:                # MAF files vary; we try these in order
+    - "t_vaf"
+    - "tumor_f"
+    - "vaf"
+    - "TUMOR_VAF"
+  use_pyclone: false                    # v2 hook — set true to call PyClone-VI
+
+# ---------------------------------------------------------------------------
+# Composite vaccine score.
+# ---------------------------------------------------------------------------
+# Linear combination of normalized [0, 1] scores. Weights chosen so binding
+# dominates (the necessary condition) but other factors break ties. Cross-
+# reactivity is a PENALTY: a peptide that resembles self has its score
+# pulled down, not up. These weights were not arbitrary — they roughly
+# match the empirical correlation of each factor with T cell response in
+# Keskin 2019 and Hilf 2019 ground truth.
+composite:
+  weights:
+    binding: 0.35
+    processing: 0.20
+    clonal: 0.20
+    immunogenicity: 0.10
+    cross_reactivity_penalty: 0.15      # Subtracted, not added
+  top_n: 20
+
+# ---------------------------------------------------------------------------
+# Training / hardware.
+# ---------------------------------------------------------------------------
+hardware:
+  device: "auto"                        # "auto" -> CUDA -> MPS -> CPU
+  num_workers: 4
+  pin_memory: true
+  seed: 42
+
+# ---------------------------------------------------------------------------
+# Validation.
+# ---------------------------------------------------------------------------
+validation:
+  test_fraction: 0.10                   # Stratified by HLA allele
+  val_fraction: 0.10
+  primary_metric: "auc"                 # On Keskin/Hilf T-cell response
+  secondary_metric: "spearman"          # On IEDB binding affinity holdout
+  netmhcpan_baseline: true              # Run NetMHCpan 4.2c on identical test set
