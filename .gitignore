@@ -1,0 +1,14 @@
+data/
+checkpoints/
+*.pt
+*.zip
+*.tar.gz
+*.csv
+*.fasta
+.DS_Store
+__pycache__/
+*.pyc
+logs/
+results/
+netMHCpan-4.2/
+netMHCpan-4.2c.Darwin_arm64.tar.gz
