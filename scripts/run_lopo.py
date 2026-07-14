@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -20,7 +21,7 @@ from pathlib import Path
 import pandas as pd
 from sklearn.metrics import roc_auc_score
 
-from gbmvax.data.validation import load_keskin
+from gbmvax.data.validation import load_keskin, load_keskin_as_iedb
 from gbmvax.utils.config import ensure_output_dirs, load_config
 
 
@@ -37,6 +38,15 @@ def _auc_or_none(labels: pd.Series, scores: pd.Series) -> float | None:
     return float(roc_auc_score(labels, scores))
 
 
+def _copy_if_exists(path: Path, artifact_dir: Path) -> Path | None:
+    if not path.exists():
+        return None
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    dest = artifact_dir / path.name
+    shutil.copy2(path, dest)
+    return dest
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=Path, default=Path("configs/config.yaml"))
@@ -50,6 +60,8 @@ def main() -> None:
                     help="Optional cap for smoke-test folds.")
     ap.add_argument("--exclude-hilf-peptides-file", type=Path, default=None,
                     help="Optional background exclusion list for sensitivity analysis.")
+    ap.add_argument("--artifact-dir", type=Path, default=None,
+                    help="Copy each fold's checkpoint, metrics, TSV, and history here as soon as it finishes.")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print commands without running them.")
     args = ap.parse_args()
@@ -67,6 +79,19 @@ def main() -> None:
     for patient in patients:
         fold = f"pt{patient}"
         checkpoint = Path(cfg["paths"]["checkpoints"]) / f"hla_binding_gbm_finetuned_{fold}.pt"
+        heldout_peptides = set(load_keskin(cfg, holdout_patient=patient)["peptide"])
+        finetune_peptides = set(load_keskin_as_iedb(
+            cfg,
+            holdout_patient=patient,
+            upsample=1,
+        )["peptide"])
+        leaked_peptides = sorted(heldout_peptides & finetune_peptides)
+        print(f"[{fold}] held-out/fine-tune peptide intersection: {leaked_peptides}")
+        if leaked_peptides:
+            raise RuntimeError(
+                f"Fold {fold} would leak held-out peptides into fine-tuning: {leaked_peptides}"
+            )
+
         finetune_cmd = [
             sys.executable, "scripts/finetune_gbm.py",
             "--config", str(args.config),
@@ -107,6 +132,16 @@ def main() -> None:
         pred_df["fold_holdout_patient"] = str(patient)
         pooled_predictions.append(pred_df)
 
+        if args.artifact_dir is not None:
+            copied = []
+            hist_path = Path(cfg["paths"]["results"]) / f"finetune_history_{fold}.json"
+            split_path = Path(cfg["paths"]["results"]) / f"iedb_gbm_finetune_test_split_{fold}.parquet"
+            for path in (checkpoint, metrics_path, pred_path, hist_path, split_path):
+                dest = _copy_if_exists(path, args.artifact_dir)
+                if dest is not None:
+                    copied.append(str(dest))
+            print(f"[{fold}] copied artifacts: {copied}")
+
     if not args.dry_run and results:
         pooled = pd.concat(pooled_predictions, ignore_index=True)
         pooled_path = Path(cfg["paths"]["results"]) / "clinical_validation_lopo_pooled_predictions.tsv"
@@ -135,6 +170,13 @@ def main() -> None:
         out_path = Path(cfg["paths"]["results"]) / "clinical_validation_lopo_summary.json"
         with open(out_path, "w") as f:
             json.dump(summary, f, indent=2)
+        if args.artifact_dir is not None:
+            copied = []
+            for path in (pooled_path, out_path):
+                dest = _copy_if_exists(path, args.artifact_dir)
+                if dest is not None:
+                    copied.append(str(dest))
+            print(f"copied LOPO summary artifacts: {copied}")
         print(json.dumps(summary, indent=2))
 
 
