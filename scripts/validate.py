@@ -52,6 +52,10 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=Path, default=Path("configs/config.yaml"))
     ap.add_argument("--checkpoint", type=Path, default=None)
+    ap.add_argument("--holdout-patient", type=str, default=None,
+                    help="Evaluate only this Keskin patient as positives against Hilf background.")
+    ap.add_argument("--exclude-hilf-peptides-file", type=Path, default=None,
+                    help="Optional one-peptide-per-line exclusion list for Hilf/background sensitivity checks.")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -61,10 +65,21 @@ def main() -> None:
     seed_everything(cfg["hardware"]["seed"])
 
     # --- Load clinical-trial ground truth ----------------------------
-    truth = load_all_validation(cfg)
+    exclude_hilf = None
+    if args.exclude_hilf_peptides_file is not None:
+        exclude_hilf = {
+            line.strip().upper()
+            for line in args.exclude_hilf_peptides_file.read_text().splitlines()
+            if line.strip() and not line.startswith("#")
+        }
+    truth = load_all_validation(
+        cfg,
+        holdout_patient=args.holdout_patient,
+        exclude_hilf_peptides=exclude_hilf,
+    )
     logger.info(f"Ground truth: {len(truth)} (patient, peptide) entries across cohorts")
-    logger.info(f"  Keskin: {(truth['cohort']=='keskin_2019').sum()}")
-    logger.info(f"  Hilf:   {(truth['cohort']=='hilf_2019').sum()}")
+    logger.info(f"  Keskin positives: {(truth['cohort']=='keskin_2019').sum()}")
+    logger.info(f"  Hilf background:  {(truth['cohort']=='hilf_2019_mutant_background').sum()}")
     logger.info(f"  Positives: {truth['response'].sum()} / {len(truth)}")
 
     # Drop rows without a parseable HLA — we need it for binding prediction.
@@ -122,7 +137,13 @@ def main() -> None:
 
     # --- Metrics ------------------------------------------------------
     y_true = truth_with_hla["response"].values
-    metrics: dict = {"n": int(len(y_true)), "n_positive": int(y_true.sum())}
+    metrics: dict = {
+        "n": int(len(y_true)),
+        "n_positive": int(y_true.sum()),
+        "holdout_patient": args.holdout_patient,
+        "n_keskin_positive": int((truth_with_hla["cohort"] == "keskin_2019").sum()),
+        "n_hilf_background": int((truth_with_hla["cohort"] == "hilf_2019_mutant_background").sum()),
+    }
 
     if y_true.sum() < 2 or y_true.sum() == len(y_true):
         logger.warning("Not enough class diversity to compute AUC — check supplement parsing")
@@ -150,8 +171,9 @@ def main() -> None:
 
     # --- Save ---------------------------------------------------------
     out_dir = Path(cfg["paths"]["results"])
-    metrics_path = out_dir / "clinical_validation.json"
-    pred_path = out_dir / "clinical_validation.tsv"
+    suffix = f"_holdout_pt{args.holdout_patient}" if args.holdout_patient else ""
+    metrics_path = out_dir / f"clinical_validation{suffix}.json"
+    pred_path = out_dir / f"clinical_validation{suffix}.tsv"
 
     with open(metrics_path, "w") as f:
         json.dump(metrics, f, indent=2)

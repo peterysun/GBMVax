@@ -49,11 +49,14 @@ def normalize_allele(allele: str) -> str:
     We truncate to 4-digit resolution (2-field) because expression-level
     differences below that almost never affect peptide binding.
     """
-    s = allele.strip().upper().replace(" ", "")
+    s = allele.strip().upper().replace(" ", "").replace("_", "")
 
-    # Drop any 'HLA-' prefix temporarily — we re-add it canonically.
+    # Drop any HLA prefix temporarily — we re-add it canonically.
+    # Supplements often use variants like "HLA B*5801" or "HLA-B*58:01".
     if s.startswith("HLA-"):
         s = s[4:]
+    elif s.startswith("HLA"):
+        s = s[3:]
 
     # Pattern 1: A*02:01 or A*02:01:01:02
     m = re.match(r"^([A-CEG])\*?(\d{2}):?(\d{2,3})", s)

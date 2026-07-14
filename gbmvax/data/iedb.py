@@ -45,32 +45,97 @@ logger = get_logger(__name__)
 
 
 # ----------------------------------------------------------------------------
-# Constants describing the IEDB schema. These column names come from the
-# second header row of mhc_ligand_full.csv (the first row is grouping).
-# If IEDB changes their schema, only these constants need updating.
+# Constants describing the IEDB schema. IEDB exports have changed names over
+# time, and many useful labels are duplicated across the two header rows
+# (for example several groups contain a column named "Name"). We therefore
+# select columns by the full (group, field) pair when a two-row header exists.
 # ----------------------------------------------------------------------------
-# We use flexible column selection because IEDB has reformatted the CSV
-# multiple times. The loader tries each candidate in order and picks the
-# first that exists.
-COL_CANDIDATES = {
-    "peptide": ["Description", "Epitope - Description", "Linear Sequence"],
-    "allele": ["Allele Name", "MHC - Allele Name", "Restricting MHC Allele"],
-    "mhc_class": ["MHC allele class", "MHC - Class"],
-    "assay_type": ["Method/Technique", "Assay - Method/Technique"],
-    "measurement_value": ["Quantitative measurement", "Assay - Quantitative measurement"],
-    "measurement_inequality": ["Measurement Inequality", "Assay - Measurement Inequality"],
-    "units": ["Units", "Assay - Units"],
-    "qualitative": ["Qualitative Measure", "Assay - Qualitative Measure"],
-    "host": ["Host - Name", "Host Organism Name"],
+ColumnCandidate = tuple[str, str] | str
+
+COL_CANDIDATES: dict[str, list[ColumnCandidate]] = {
+    "peptide": [
+        ("Epitope", "Description"),
+        ("Epitope", "Name"),
+        ("Epitope", "Linear Sequence"),
+        "Description",
+        "Epitope - Description",
+        "Linear Sequence",
+    ],
+    "allele": [
+        ("MHC Restriction", "Name"),
+        "Allele Name",
+        "MHC - Allele Name",
+        "Restricting MHC Allele",
+    ],
+    "mhc_class": [
+        ("MHC Restriction", "Class"),
+        "MHC allele class",
+        "MHC - Class",
+    ],
+    "assay_type": [
+        ("Assay", "Method"),
+        "Method/Technique",
+        "Assay - Method/Technique",
+    ],
+    "measurement_value": [
+        ("Assay", "Quantitative measurement"),
+        "Quantitative measurement",
+        "Assay - Quantitative measurement",
+    ],
+    "measurement_inequality": [
+        ("Assay", "Measurement Inequality"),
+        "Measurement Inequality",
+        "Assay - Measurement Inequality",
+    ],
+    "units": [
+        ("Assay", "Units"),
+        "Units",
+        "Assay - Units",
+    ],
+    "qualitative": [
+        ("Assay", "Qualitative Measurement"),
+        "Qualitative Measure",
+        "Qualitative Measurement",
+        "Assay - Qualitative Measure",
+    ],
+    "host": [
+        ("Host", "Name"),
+        "Host - Name",
+        "Host Organism Name",
+    ],
 }
 
 
-def _pick_column(df_cols: pd.Index, candidates: list[str]) -> Optional[str]:
-    """Return the first candidate that exists in df_cols, else None."""
-    for c in candidates:
-        if c in df_cols:
-            return c
+def _norm_header(value) -> str:
+    return str(value).strip().lower()
+
+
+def _pick_column_index(df_cols: pd.Index, candidates: list[ColumnCandidate]) -> Optional[int]:
+    """Return the integer column position for the first matching candidate."""
+    for cand in candidates:
+        if isinstance(cand, tuple):
+            want = tuple(_norm_header(x) for x in cand)
+            for i, col in enumerate(df_cols):
+                if isinstance(col, tuple) and tuple(_norm_header(x) for x in col[:2]) == want:
+                    return i
+        else:
+            want = _norm_header(cand)
+            for i, col in enumerate(df_cols):
+                if isinstance(col, tuple):
+                    # Match either the specific field name or a previously
+                    # flattened "Group - Field" style export.
+                    group = _norm_header(col[0])
+                    field = _norm_header(col[1])
+                    if field == want or f"{group} - {field}" == want:
+                        return i
+                elif _norm_header(col) == want:
+                    return i
     return None
+
+
+def _series(df: pd.DataFrame, col_idx: int) -> pd.Series:
+    """Return a column by position, avoiding duplicate-name ambiguity."""
+    return df.iloc[:, col_idx]
 
 
 # ----------------------------------------------------------------------------
@@ -90,6 +155,7 @@ def load_iedb(
     csv_path: Path | str,
     peptide_lengths: tuple[int, ...] = (8, 9, 10, 11),
     max_rows: Optional[int] = None,
+    exclude_peptides: set[str] | None = None,
 ) -> pd.DataFrame:
     """
     Load and clean the IEDB MHC ligand CSV.
@@ -117,13 +183,11 @@ def load_iedb(
         nrows=max_rows,
     )
 
-    # Flatten the MultiIndex: take the second-level (more specific) names.
-    df_raw.columns = [col[1] if isinstance(col, tuple) else col for col in df_raw.columns]
-
-    # Map our logical column names to actual columns present in this file version.
-    col_map: dict[str, str] = {}
+    # Map our logical column names to integer positions. Position-based access
+    # is important because IEDB has duplicate second-level names like "Name".
+    col_map: dict[str, int] = {}
     for logical, candidates in COL_CANDIDATES.items():
-        actual = _pick_column(df_raw.columns, candidates)
+        actual = _pick_column_index(df_raw.columns, candidates)
         if actual is None and logical in ("peptide", "allele"):
             raise KeyError(f"Required column {logical!r} not found in IEDB CSV. Schema may have changed.")
         if actual is not None:
@@ -133,13 +197,13 @@ def load_iedb(
 
     # Build the tidy frame column by column.
     out = pd.DataFrame()
-    out["peptide"] = df_raw[col_map["peptide"]].astype(str).str.strip().str.upper()
-    out["allele_raw"] = df_raw[col_map["allele"]].astype(str)
+    out["peptide"] = _series(df_raw, col_map["peptide"]).astype(str).str.strip().str.upper()
+    out["allele_raw"] = _series(df_raw, col_map["allele"]).astype(str)
 
     # MHC class filter — we want class I only (length 8-11 is class I anyway,
     # but filtering by class is more reliable).
     if "mhc_class" in col_map:
-        cls = df_raw[col_map["mhc_class"]].astype(str).str.upper()
+        cls = _series(df_raw, col_map["mhc_class"]).astype(str).str.upper()
         out = out[cls.str.contains("I", na=False) & ~cls.str.contains("II", na=False)]
 
     # Drop rows whose peptide contains non-canonical residues (X, B, Z, U,
@@ -148,6 +212,12 @@ def load_iedb(
     valid_aa = set(AMINO_ACIDS)
     mask = out["peptide"].apply(lambda s: len(s) > 0 and all(c in valid_aa for c in s))
     out = out[mask]
+
+    if exclude_peptides:
+        excluded = {str(p).strip().upper() for p in exclude_peptides}
+        before = len(out)
+        out = out[~out["peptide"].isin(excluded)]
+        logger.info(f"Excluded {before - len(out):,} rows matching held-out validation peptides")
 
     # Peptide length filter — 8–11 captures >99% of class I ligands.
     out["length"] = out["peptide"].str.len()
@@ -175,9 +245,9 @@ def load_iedb(
     if "measurement_value" in col_map:
         # Re-index df_raw to align with our filtered frame.
         df_raw_aligned = df_raw.loc[out.index]
-        meas = pd.to_numeric(df_raw_aligned[col_map["measurement_value"]], errors="coerce")
+        meas = pd.to_numeric(_series(df_raw_aligned, col_map["measurement_value"]), errors="coerce")
         units = (
-            df_raw_aligned[col_map["units"]].astype(str).str.lower()
+            _series(df_raw_aligned, col_map["units"]).astype(str).str.lower()
             if "units" in col_map else pd.Series("nm", index=out.index)
         )
 
@@ -198,13 +268,13 @@ def load_iedb(
     # Presentation stream: assays whose method is mass-spec elution.
     # ------------------------------------------------------------------
     if "assay_type" in col_map:
-        assay_str = df_raw.loc[out.index, col_map["assay_type"]].astype(str).str.lower()
+        assay_str = _series(df_raw.loc[out.index], col_map["assay_type"]).astype(str).str.lower()
         is_elution = assay_str.apply(lambda s: any(kw in s for kw in ELUTION_ASSAY_KEYWORDS))
         out["source_assay"] = assay_str
 
         # Qualitative measure: 'Positive', 'Positive-High', 'Negative', etc.
         if "qualitative" in col_map:
-            qual = df_raw.loc[out.index, col_map["qualitative"]].astype(str).str.lower()
+            qual = _series(df_raw.loc[out.index], col_map["qualitative"]).astype(str).str.lower()
             # Most eluted-ligand mass spec rows are positives by construction
             # (something had to be eluted for it to appear). Negatives are rare
             # and come from decoy panels. Treat anything starting with 'positive'

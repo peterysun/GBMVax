@@ -61,6 +61,8 @@ def train_hla_binding(
     cfg: dict,
     checkpoint_dir: Path,
     log_dir: Optional[Path] = None,
+    init_checkpoint: Optional[Path] = None,
+    checkpoint_name: str = "hla_binding_best.pt",
 ) -> tuple[HLABindingTransformer, dict]:
     """
     Train the multi-task HLA binding model.
@@ -101,6 +103,12 @@ def train_hla_binding(
         max_peptide_len=hp["max_peptide_len"],
         pseudoseq_len=hp["hla_pseudosequence_length"],
     )
+    if init_checkpoint is not None:
+        sd = torch.load(init_checkpoint, map_location="cpu")
+        state_dict = sd.get("model_state", sd)
+        model.load_state_dict(state_dict)
+        logger.info(f"Initialized model from {init_checkpoint}")
+
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=hp["lr"],
@@ -118,7 +126,7 @@ def train_hla_binding(
     }
     patience_counter = 0
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    best_ckpt_path = checkpoint_dir / "hla_binding_best.pt"
+    best_ckpt_path = checkpoint_dir / checkpoint_name
 
     for epoch in range(hp["num_epochs"]):
         # -------- TRAIN --------

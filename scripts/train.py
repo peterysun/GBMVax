@@ -18,6 +18,7 @@ import json
 from pathlib import Path
 
 from gbmvax.data.iedb import load_iedb, stratified_train_val_test_split
+from gbmvax.data.validation import external_validation_peptides
 from gbmvax.models.dataset import IEDBDataset
 from gbmvax.models.trainer import train_hla_binding
 from gbmvax.utils.config import ensure_output_dirs, load_config
@@ -30,6 +31,8 @@ def main() -> None:
     ap.add_argument("--config", type=Path, default=Path("configs/config.yaml"))
     ap.add_argument("--debug", action="store_true",
                     help="Load only 100k IEDB rows for fast iteration.")
+    ap.add_argument("--exclude-validation-peptides", action="store_true",
+                    help="Remove Keskin/Hilf external-validation peptides from IEDB before splitting.")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -45,10 +48,12 @@ def main() -> None:
     logger.info("=" * 60)
 
     # --- Load IEDB ----------------------------------------------------
+    excluded_peptides = external_validation_peptides(cfg) if args.exclude_validation_peptides else None
     iedb = load_iedb(
         cfg["paths"]["iedb"]["mhc_ligand"],
         peptide_lengths=tuple(cfg["peptide"]["lengths"]),
         max_rows=100_000 if args.debug else None,
+        exclude_peptides=excluded_peptides,
     )
 
     # --- Load HLA pseudosequences ------------------------------------

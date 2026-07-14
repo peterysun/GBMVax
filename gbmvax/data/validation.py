@@ -1,25 +1,19 @@
 """
-validation.py — load Keskin 2019 and Hilf 2019 clinical-trial supplements.
+validation.py — explicit Keskin 2019 and Hilf 2019 clinical-validation loaders.
 
-These are the ONLY datasets in the world with both:
-    (a) GBM-patient neoantigen vaccines administered, and
-    (b) Per-peptide T-cell response measurements (ELISpot, tetramer staining).
-
-They are our ground truth for the primary validation metric: can GBMVax
-predict which neoantigens actually elicited T cell responses?
-
-The supplements are Excel files with multiple sheets. Format is non-uniform:
-Keskin uses one row per (patient, peptide) with a 'Response' column; Hilf
-uses a peptide-by-patient matrix. We standardize both into a tidy long
-table.
+The previous heuristic loader silently parsed the wrong Hilf column as a
+positive-only cohort and missed Keskin Table S5 entirely. These loaders are
+purposefully table-specific: the validation claim depends on exact columns.
 
 Returned schema:
     patient_id    str
     peptide       str
     hla_allele    str
-    response      int     1 if T cell response observed, 0 otherwise
-    cohort        str     'keskin_2019' or 'hilf_2019'
-    notes         str     Original assay column (for traceability)
+    response      int     1 for Keskin immunizing peptide, 0 for Hilf mutant background
+    cohort        str     'keskin_2019' or 'hilf_2019_mutant_background'
+    source_file   str
+    source_sheet  str
+    source_row    int     1-based spreadsheet row for auditability
 """
 
 from __future__ import annotations
@@ -35,146 +29,179 @@ from gbmvax.utils.sequences import AMINO_ACIDS
 logger = get_logger(__name__)
 
 _VALID_AA = set(AMINO_ACIDS)
+KESKIN_TABLE_S5 = "41586_2018_792_MOESM5_ESM.xlsx"
+HILF_TABLE = "41586_2018_810_MOESM3_ESM.xlsx"
 
 
-# ----------------------------------------------------------------------------
-# Heuristics for picking the relevant columns. Keskin and Hilf supplements
-# are not standardized — sheet and column names vary. We hardcode the
-# patterns observed in the published files. If Nature reformats the
-# supplements (rare but possible), update these.
-# ----------------------------------------------------------------------------
-PEPTIDE_COL_HINTS = ("peptide", "epitope", "sequence", "neoantigen")
-RESPONSE_COL_HINTS = ("response", "elispot", "ifn", "tcell", "immunogen", "reactiv")
-HLA_COL_HINTS = ("hla", "allele", "restriction")
-PATIENT_COL_HINTS = ("patient", "subject", "donor", "id")
-
-
-def _find_col(cols: list[str], hints: tuple[str, ...]) -> str | None:
-    """Return first column whose lowercased name contains any hint."""
-    for c in cols:
-        cl = str(c).lower()
-        if any(h in cl for h in hints):
-            return c
-    return None
-
-
-def _is_peptide(s: str) -> bool:
-    """Lenient check: 8-15 residues, canonical amino acids only."""
-    s = str(s).strip().upper()
+def _is_peptide(value) -> bool:
+    s = str(value).strip().upper()
     return 8 <= len(s) <= 15 and all(c in _VALID_AA for c in s)
 
 
-def _load_supplement_dir(dir_path: Path, cohort: str) -> pd.DataFrame:
-    """
-    Iterate over every .xlsx in dir_path and try to extract a tidy
-    (patient, peptide, hla, response) table from each sheet.
+def _clean_peptide(value) -> str:
+    return str(value).strip().upper()
 
-    Robustness strategy: try to find columns by hint; if a column is
-    missing, fall through. Aggressively drop rows that don't look like
-    real peptide entries.
+
+def _patient_id(value, width: int | None = None) -> str:
+    if pd.isna(value):
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        out = str(int(value))
+    else:
+        out = str(value).strip()
+    return out.zfill(width) if width else out
+
+
+def _safe_normalize_allele(value) -> str:
+    if pd.isna(value):
+        return ""
+    raw = str(value).strip()
+    if not raw:
+        return ""
+    try:
+        return normalize_allele(raw)
+    except ValueError:
+        return ""
+
+
+def _validation_dir(cfg: dict, key: str) -> Path:
+    return Path(cfg["paths"]["validation"][key])
+
+
+def load_keskin(cfg: dict, holdout_patient: str | None = None) -> pd.DataFrame:
     """
+    Load Keskin 2019 Table S5 immunizing mutated class-I peptides.
+
+    Table S5 columns are fixed in the Nature supplement:
+      A Patient ID, F HLA allele, G mutated peptide sequence, H affinity.
+    These rows are positive examples for response/ranking validation.
+    """
+    path = _validation_dir(cfg, "keskin_2019") / KESKIN_TABLE_S5
+    raw = pd.read_excel(path, sheet_name="Table S5", header=None)
     rows: list[dict] = []
+    holdout = _patient_id(holdout_patient) if holdout_patient is not None else None
 
-    for xlsx in sorted(dir_path.glob("*.xlsx")):
-        try:
-            # sheet_name=None reads all sheets into a dict.
-            book = pd.read_excel(xlsx, sheet_name=None, header=None)
-        except Exception as e:                     # noqa: BLE001 — supplement files vary
-            logger.warning(f"Could not open {xlsx.name}: {e}")
+    for idx, r in raw.iloc[4:].iterrows():
+        patient = _patient_id(r.iloc[0])
+        peptide = _clean_peptide(r.iloc[6])
+        if not patient or not _is_peptide(peptide):
             continue
+        if holdout is not None and patient != holdout:
+            continue
+        rows.append({
+            "patient_id": patient,
+            "peptide": peptide,
+            "hla_allele": _safe_normalize_allele(r.iloc[5]),
+            "response": 1,
+            "cohort": "keskin_2019",
+            "source_file": path.name,
+            "source_sheet": "Table S5",
+            "source_row": int(idx + 1),
+        })
 
-        for sheet_name, raw in book.items():
-            # Detect the header row. Supplements often have title text in
-            # rows 0-2. We assume the row containing 'peptide' or 'epitope'
-            # is the header.
-            header_row = None
-            for i in range(min(8, len(raw))):
-                row_strs = [str(x).lower() for x in raw.iloc[i].tolist()]
-                if any(any(h in s for h in PEPTIDE_COL_HINTS) for s in row_strs):
-                    header_row = i
-                    break
-            if header_row is None:
-                continue
-
-            # Re-read with the detected header.
-            df = raw.iloc[header_row + 1:].copy()
-            df.columns = [str(c) for c in raw.iloc[header_row].tolist()]
-            df = df.dropna(how="all")
-
-            pep_col = _find_col(df.columns.tolist(), PEPTIDE_COL_HINTS)
-            resp_col = _find_col(df.columns.tolist(), RESPONSE_COL_HINTS)
-            hla_col = _find_col(df.columns.tolist(), HLA_COL_HINTS)
-            pat_col = _find_col(df.columns.tolist(), PATIENT_COL_HINTS)
-
-            if pep_col is None:
-                continue
-
-            for _, r in df.iterrows():
-                pep = str(r[pep_col]).strip().upper()
-                if not _is_peptide(pep):
-                    continue
-
-                # Response — accept many encodings:
-                #   numeric > 0 -> positive
-                #   '+', 'positive', 'yes', 'response' -> positive
-                #   '-', 'negative', 'no', 'none', 0, NaN -> negative
-                if resp_col is not None:
-                    raw_resp = r[resp_col]
-                    response = _parse_response(raw_resp)
-                else:
-                    response = 1                  # In Keskin Table S5 every listed peptide was tested positive
-
-                hla = str(r[hla_col]).strip() if hla_col and pd.notna(r[hla_col]) else ""
-                try:
-                    hla_norm = normalize_allele(hla) if hla else ""
-                except ValueError:
-                    hla_norm = ""
-
-                patient = str(r[pat_col]).strip() if pat_col and pd.notna(r[pat_col]) else xlsx.stem
-
-                rows.append({
-                    "patient_id": patient,
-                    "peptide": pep,
-                    "hla_allele": hla_norm,
-                    "response": response,
-                    "cohort": cohort,
-                    "source_file": xlsx.name,
-                    "source_sheet": sheet_name,
-                })
-
-    out = pd.DataFrame(rows).drop_duplicates(subset=["patient_id", "peptide"])
-    logger.info(f"{cohort}: extracted {len(out)} (patient, peptide) rows from {dir_path}")
+    out = pd.DataFrame(rows)
+    logger.info(
+        f"keskin_2019: loaded {len(out)} Table S5 rows "
+        f"({out['patient_id'].nunique() if len(out) else 0} patients)"
+    )
     return out
 
 
-def _parse_response(value) -> int:
-    """Coerce a heterogeneous response cell to 0/1."""
-    if pd.isna(value):
-        return 0
-    if isinstance(value, (int, float)):
-        return int(value > 0)
-    s = str(value).strip().lower()
-    if s in {"+", "positive", "yes", "y", "1", "true", "response", "reactive"}:
-        return 1
-    if s in {"-", "negative", "no", "n", "0", "false", "none", "nd", "n/a"}:
-        return 0
-    # Numeric-looking strings ("2.5", "150 sfu")
-    try:
-        return int(float(s.split()[0]) > 0)
-    except (ValueError, IndexError):
-        return 0
+def load_hilf(cfg: dict, exclude_peptides: set[str] | None = None) -> pd.DataFrame:
+    """
+    Load Hilf 2019 mutant/background epitope rows as response=0.
+
+    In the Hilf supplement, row 2 contains the specific subheaders:
+      A Patient, I best allele, K mutant epitope, L wild-type epitope.
+    The historical Keskin-vs-Hilf validation uses the mutant epitope
+    column as negatives against Keskin immunizing positives.
+    """
+    path = _validation_dir(cfg, "hilf_2019") / HILF_TABLE
+    raw = pd.read_excel(path, sheet_name="Suppl. Table. 3_FINAL", header=None)
+    excluded = {p.strip().upper() for p in exclude_peptides or set()}
+    rows: list[dict] = []
+
+    for idx, r in raw.iloc[2:].iterrows():
+        patient = _patient_id(r.iloc[0], width=2)
+        peptide = _clean_peptide(r.iloc[10])
+        if not patient or not _is_peptide(peptide):
+            continue
+        if peptide in excluded:
+            continue
+        rows.append({
+            "patient_id": patient,
+            "peptide": peptide,
+            "hla_allele": _safe_normalize_allele(r.iloc[8]),
+            "response": 0,
+            "cohort": "hilf_2019_mutant_background",
+            "source_file": path.name,
+            "source_sheet": "Suppl. Table. 3_FINAL",
+            "source_row": int(idx + 1),
+        })
+
+    out = pd.DataFrame(rows)
+    logger.info(
+        f"hilf_2019_mutant_background: loaded {len(out)} mutant/background rows "
+        f"({out['patient_id'].nunique() if len(out) else 0} patients)"
+    )
+    return out
 
 
-def load_keskin(cfg: dict) -> pd.DataFrame:
-    """Load Keskin 2019 supplements."""
-    return _load_supplement_dir(Path(cfg["paths"]["validation"]["keskin_2019"]), "keskin_2019")
+def load_all_validation(
+    cfg: dict,
+    holdout_patient: str | None = None,
+    exclude_hilf_peptides: set[str] | None = None,
+) -> pd.DataFrame:
+    """Return Keskin positives plus Hilf mutant/background negatives."""
+    return pd.concat([
+        load_keskin(cfg, holdout_patient=holdout_patient),
+        load_hilf(cfg, exclude_peptides=exclude_hilf_peptides),
+    ], ignore_index=True)
 
 
-def load_hilf(cfg: dict) -> pd.DataFrame:
-    """Load Hilf 2019 supplements."""
-    return _load_supplement_dir(Path(cfg["paths"]["validation"]["hilf_2019"]), "hilf_2019")
+def load_keskin_as_iedb(
+    cfg: dict,
+    holdout_patient: str | None = None,
+    upsample: int = 10,
+) -> pd.DataFrame:
+    """
+    Convert Keskin Table S5 positives to the cleaned IEDB training schema.
+
+    `holdout_patient` is excluded from the returned rows. This is the core
+    leakage guard for leave-one-patient-out fine-tuning.
+    """
+    all_rows = load_keskin(cfg)
+    if holdout_patient is not None:
+        holdout = _patient_id(holdout_patient)
+        heldout_peptides = set(all_rows.loc[all_rows["patient_id"] == holdout, "peptide"])
+        all_rows = all_rows[
+            (all_rows["patient_id"] != holdout)
+            & ~all_rows["peptide"].isin(heldout_peptides)
+        ].reset_index(drop=True)
+
+    train_rows = all_rows[all_rows["hla_allele"].str.startswith("HLA-")].copy()
+    out = pd.DataFrame({
+        "peptide": train_rows["peptide"],
+        "allele": train_rows["hla_allele"],
+        "length": train_rows["peptide"].str.len(),
+        "affinity_nM": pd.NA,
+        "log_affinity": pd.NA,
+        "presented": 1,
+        "is_affinity": False,
+        "is_presentation": True,
+        "source_assay": "keskin_2019_table_s5_lopo_finetune",
+        "source_patient_id": train_rows["patient_id"],
+        "source_row": train_rows["source_row"],
+    })
+    out["affinity_nM"] = pd.to_numeric(out["affinity_nM"], errors="coerce")
+    out["log_affinity"] = pd.to_numeric(out["log_affinity"], errors="coerce")
+
+    if upsample > 1 and len(out):
+        out = pd.concat([out] * upsample, ignore_index=True)
+    return out.reset_index(drop=True)
 
 
-def load_all_validation(cfg: dict) -> pd.DataFrame:
-    """Concat both clinical-trial cohorts for the primary validation metric."""
-    return pd.concat([load_keskin(cfg), load_hilf(cfg)], ignore_index=True)
+def external_validation_peptides(cfg: dict) -> set[str]:
+    """All peptide sequences used by the external clinical validation set."""
+    df = load_all_validation(cfg)
+    return set(df["peptide"].astype(str).str.strip().str.upper())
