@@ -135,6 +135,12 @@ class GBMVaxPipeline:
     def load_model(self, checkpoint_path: Path | str) -> None:
         """Load trained binding-model weights from a .pt checkpoint."""
         ckpt = torch.load(checkpoint_path, map_location="cpu")
+        ckpt_hla = ckpt.get("config", {}).get("hla_model")
+        if isinstance(ckpt_hla, dict):
+            merged = self.cfg["hla_model"].copy()
+            merged.update(ckpt_hla)
+            self.cfg["hla_model"] = merged
+            logger.info(f"Using hla_model architecture from {checkpoint_path}")
         hp = self.cfg["hla_model"]
         model = HLABindingTransformer(
             embed_dim=hp["embed_dim"],

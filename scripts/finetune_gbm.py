@@ -15,6 +15,7 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import torch
 
 from gbmvax.data.iedb import load_iedb, stratified_train_val_test_split
 from gbmvax.data.validation import external_validation_peptides, load_keskin_as_iedb
@@ -50,7 +51,14 @@ def main() -> None:
     logger = get_logger("finetune_gbm")
     seed_everything(cfg["hardware"]["seed"])
 
+    base_ckpt = args.base_checkpoint or (Path(cfg["paths"]["checkpoints"]) / "hla_binding_best.pt")
     ft_cfg = copy.deepcopy(cfg)
+    if base_ckpt.exists():
+        ckpt = torch.load(base_ckpt, map_location="cpu")
+        ckpt_hla = ckpt.get("config", {}).get("hla_model")
+        if isinstance(ckpt_hla, dict):
+            ft_cfg["hla_model"].update(ckpt_hla)
+            logger.info(f"Using hla_model architecture from {base_ckpt}")
     ft_cfg["hla_model"]["num_epochs"] = args.epochs
     ft_cfg["hla_model"]["lr"] = args.lr
 
@@ -86,11 +94,10 @@ def main() -> None:
     logger.info(f"Fine-tune test split saved to {test_path}")
 
     pseudoseq_map = build_pseudosequence_map(cfg["paths"]["hla"]["sequences"])
-    hp = cfg["hla_model"]
+    hp = ft_cfg["hla_model"]
     train_ds = IEDBDataset(train_df, pseudoseq_map, hp["max_peptide_len"], hp["hla_pseudosequence_length"])
     val_ds = IEDBDataset(val_df, pseudoseq_map, hp["max_peptide_len"], hp["hla_pseudosequence_length"])
 
-    base_ckpt = args.base_checkpoint or (Path(cfg["paths"]["checkpoints"]) / "hla_binding_best.pt")
     ckpt_name = f"hla_binding_gbm_finetuned_{fold}.pt"
     model, history = train_hla_binding(
         train_ds=train_ds,
